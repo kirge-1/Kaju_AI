@@ -1,0 +1,46 @@
+# Kullanıcı verileri
+users/
+users/**/*.json
+
+# Loglar
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Sanal ortamlar
+venv/
+.venv/
+env/
+
+# Ortam değişkenleri
+.env
+.env.*
+*.env
+
+# Gizli veya yerel ayar dosyaları
+*secret*.py
+*token*.py
+*credential*.py
+config_local.py
+local_settings.py
+secrets.py
+
+# VS Code
+.vscode/
+
+# Sistem dosyaları
+.DS_Store
+Thumbs.db
+
+# Anahtar/dosya tabanlı gizli içerikler
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.sqlite3
+*.db
