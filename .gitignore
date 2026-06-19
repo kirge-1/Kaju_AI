@@ -49,3 +49,6 @@ Thumbs.db
 5aşamalıplan/
 test_dosyaları/
 test_dosyalarına/
+
+# Ignore config
+config.py
