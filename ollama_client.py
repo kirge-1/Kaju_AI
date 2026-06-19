@@ -1,13 +1,37 @@
 import json
 import re
+import threading
+from hashlib import sha256
  
 import requests
  
 from history_manager import append_exchange, load_chat_history
 from logger import LOGGER
 from config import OLLAMA_MODEL, OLLAMA_URL
-from memory_manager import load_profile, update_profile, ensure_user_data, save_user_data, add_pending_memory, get_pending_memory, confirm_pending_memory
+from memory_manager import (
+    load_profile,
+    update_profile,
+    ensure_user_data,
+    save_user_data,
+    add_pending_memory,
+    get_pending_memory,
+    confirm_pending_memory,
+    add_pending_followup,
+    get_pending_followups,
+    pop_pending_followups,
+)
+from cache import LRUCache
 
+# Lightweight local cache for repeated queries
+CACHE = LRUCache(capacity=1024)
+
+# Quick-response templates (short, safe, tested)
+TEMPLATES = [
+    (re.compile(r"\bnpm install\b|Cannot find module|cannot find module", flags=re.I),
+     "1) node_modules klasörünü sil\n2) npm cache clean --force\n3) npm install\nPackage.json'daki paket adını kontrol et; sonra sonucu söyle."),
+    (re.compile(r"^(selam|merhaba|naber|hey)\b", flags=re.I),
+     "Selam {name}, naber? 👋"),
+], ensure_user_data, save_user_data, add_pending_memory, get_pending_memory, confirm_pending_memory
 SYSTEM_PROMPT = "Sen Kaju'sun. Türkçe konuşan, zeki ve samimi bir sohbet asistanısın."
  
 MEMORY_EXTRACT_PROMPT = (
@@ -182,11 +206,32 @@ def _sanitize_output(profile: dict, text: str) -> str:
     return " ".join(text.split()).strip()
  
  
+def _background_enrich_and_save(user_id: int, user_message: str, system_prompt: str, messages: list[dict]):
+    """Arka planda tam model çağrısı yapar ve sonucu pending followup olarak kaydeder."""
+    try:
+        detailed = ollama_chat(messages=messages, system=system_prompt)
+        detailed = _sanitize_output(load_profile(user_id), detailed)
+        # save as pending followup for user to request
+        add_pending_followup(user_id, detailed)
+    except Exception:
+        LOGGER.exception("Background enrichment failed for user_id=%s", user_id)
+
+
 def process_user_message(user_id: int, user_message: str) -> str:
-    """Kullanıcının mesajını işler, yanıt üretir ve hafızayı günceller."""
+    """Kullanıcının mesajını işler, hızlı yanıt üretir, arka planda detay çıkarır ve hafızayı günceller."""
     profile = load_profile(user_id)
     chat_history = load_chat_history(user_id)
- 
+
+    # quick cache key
+    cache_key = sha256((str(user_id) + '|' + user_message.strip()).encode('utf-8')).hexdigest()
+    cached = CACHE.get(cache_key)
+    if cached:
+        try:
+            append_exchange(user_id, user_message, cached)
+        except OSError:
+            LOGGER.exception("History update failed for user_id=%s", user_id)
+        return cached
+
     # İsim sorgulama
     if re.search(r"\b(benim adım ne|adım ne)\b", user_message, flags=re.I):
         if profile.get("name"):
@@ -197,8 +242,9 @@ def process_user_message(user_id: int, user_message: str) -> str:
             append_exchange(user_id, user_message, reply)
         except OSError:
             LOGGER.exception("History update failed for user_id=%s", user_id)
+        CACHE.set(cache_key, reply)
         return reply
- 
+
     # Doğrudan isim belirtme
     m = re.match(r"^\s*benim adım\s+(.+?)\s*$", user_message, flags=re.I)
     if m:
@@ -213,8 +259,9 @@ def process_user_message(user_id: int, user_message: str) -> str:
                 append_exchange(user_id, user_message, reply)
             except OSError:
                 LOGGER.exception("History update failed for user_id=%s", user_id)
+            CACHE.set(cache_key, reply)
             return reply
- 
+
     # Normal akış - öncelikle hızlı lokal yollar (low-latency handlers)
     # 1) Kalıcı hafıza isteği: "aklında tut", "bil", "unutma"
     if re.search(r"\b(aklında tut|aklinda tut|bil|unutma)\b", user_message, flags=re.I):
@@ -229,20 +276,27 @@ def process_user_message(user_id: int, user_message: str) -> str:
             append_exchange(user_id, user_message, reply)
         except OSError:
             LOGGER.exception("History update failed for user_id=%s", user_id)
+        CACHE.set(cache_key, reply)
         return reply
 
     # 2) Hızlı çözüm şablonları (özellikle npm hataları gibi sık durumlar)
-    if re.search(r"\bnpm install\b|Cannot find module|cannot find module", user_message, flags=re.I):
-        reply = (
-            "1) node_modules klasörünü sil\n"
-            "2) npm cache clean --force\n"
-            "3) npm install\n"
-            "Package.json'daki paket adını kontrol et; sonra sonucu söyle.")
-        try:
-            append_exchange(user_id, user_message, reply)
-        except OSError:
-            LOGGER.exception("History update failed for user_id=%s", user_id)
-        return reply
+    for pattern, template in TEMPLATES:
+        if pattern.search(user_message):
+            # personalize
+            if '{name}' in template:
+                template = template.format(name=profile.get('name') or '')
+            reply = template
+            try:
+                append_exchange(user_id, user_message, reply)
+            except OSError:
+                LOGGER.exception("History update failed for user_id=%s", user_id)
+            CACHE.set(cache_key, reply)
+
+            # start background enrichment to produce detailed reply
+            system_prompt, messages = build_messages(profile, chat_history, user_message)
+            t = threading.Thread(target=_background_enrich_and_save, args=(user_id, user_message, system_prompt, messages), daemon=True)
+            t.start()
+            return reply
 
     # 3) Hızlı selamlama yanıtları
     if re.match(r"^(selam|merhaba|naber|hey)\b", user_message, flags=re.I):
@@ -255,9 +309,10 @@ def process_user_message(user_id: int, user_message: str) -> str:
             append_exchange(user_id, user_message, reply)
         except OSError:
             LOGGER.exception("History update failed for user_id=%s", user_id)
+        CACHE.set(cache_key, reply)
         return reply
 
-    # Fallback: model çağrısı
+    # Fallback: model çağrısı (yavaş ama tam)
     system_prompt, messages = build_messages(profile, chat_history, user_message)
     assistant_message = ollama_chat(messages=messages, system=system_prompt)
     assistant_message = _sanitize_output(profile, assistant_message)
@@ -284,5 +339,6 @@ def process_user_message(user_id: int, user_message: str) -> str:
     except OSError as exc:
         LOGGER.exception("History update failed for user_id=%s: %s", user_id, exc)
 
+    CACHE.set(cache_key, assistant_message)
     return assistant_message
  

@@ -48,6 +48,9 @@ def normalize_user_data(data: object) -> dict:
         "pending_memory": [str(item) for item in pending if item is not None]
         if isinstance(pending, list)
         else [],
+        "pending_followups": [str(item) for item in data.get("pending_followups", []) if item is not None]
+        if isinstance(data.get("pending_followups", []), list)
+        else [],
     }
 
 
@@ -79,6 +82,29 @@ def save_user_data(user_id: int, data: dict) -> None:
     with path.open("w", encoding="utf-8") as file:
         json.dump(data, file, ensure_ascii=False, indent=2)
 
+
+# Pending followups helpers
+def add_pending_followup(user_id: int, text: str) -> None:
+    """Kullanıcıya gönderilecek arka plan detayını ekler."""
+    data = ensure_user_data(user_id)
+    pending = data.get("pending_followups", [])
+    pending.append(str(text))
+    data["pending_followups"] = pending
+    save_user_data(user_id, data)
+
+
+def get_pending_followups(user_id: int) -> list:
+    data = ensure_user_data(user_id)
+    return data.get("pending_followups", [])
+
+
+def pop_pending_followups(user_id: int) -> list:
+    """Tüm pending followup'ları alır ve temizler."""
+    data = ensure_user_data(user_id)
+    pending = data.get("pending_followups", [])
+    data["pending_followups"] = []
+    save_user_data(user_id, data)
+    return pending
 
 def load_profile(user_id: int) -> dict:
     """Kullanıcının profil bölümünü döndürür."""
