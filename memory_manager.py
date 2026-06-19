@@ -12,6 +12,7 @@ def default_user_data() -> dict:
             "facts": [],
         },
         "chat_history": [],
+        "pending_memory": [],
     }
 
 
@@ -31,6 +32,7 @@ def normalize_user_data(data: object) -> dict:
     interests = profile.get("interests")
     facts = profile.get("facts")
     chat_history = data.get("chat_history")
+    pending = data.get("pending_memory")
 
     return {
         "profile": {
@@ -43,6 +45,9 @@ def normalize_user_data(data: object) -> dict:
             else [],
         },
         "chat_history": chat_history if isinstance(chat_history, list) else [],
+        "pending_memory": [str(item) for item in pending if item is not None]
+        if isinstance(pending, list)
+        else [],
     }
 
 
@@ -126,5 +131,41 @@ def update_profile(
     if facts_to_remove:
         profile["facts"] = remove_matching_entries(profile["facts"], facts_to_remove)
 
+    save_user_data(user_id, data)
+    return profile
+
+
+def add_pending_memory(user_id: int, item: str) -> None:
+    """Kullanıcının onay bekleyen hafıza girdisini ekler."""
+    data = ensure_user_data(user_id)
+    pending = data.get("pending_memory", [])
+    pending.append(str(item))
+    data["pending_memory"] = pending
+    save_user_data(user_id, data)
+
+
+def get_pending_memory(user_id: int) -> list:
+    data = ensure_user_data(user_id)
+    return data.get("pending_memory", [])
+
+
+def confirm_pending_memory(user_id: int, index: int | None = None) -> dict:
+    """Bekleyen girdileri kalıcı "facts" listesine taşır. index verilmezse tümünü onaylar."""
+    data = ensure_user_data(user_id)
+    pending = data.get("pending_memory", [])
+    if not pending:
+        return data["profile"]
+    to_confirm = pending if index is None else [pending[index]]
+    profile = data["profile"]
+    facts = profile.get("facts", [])
+    for itm in to_confirm:
+        if itm not in facts:
+            facts.append(itm)
+    profile["facts"] = facts
+    if index is None:
+        data["pending_memory"] = []
+    else:
+        # remove the confirmed item
+        del data["pending_memory"][index]
     save_user_data(user_id, data)
     return profile

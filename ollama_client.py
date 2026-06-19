@@ -1,23 +1,15 @@
 import json
 import re
-
+ 
 import requests
-
-from history_manager import append_exchange, format_chat_history, load_chat_history
+ 
+from history_manager import append_exchange, load_chat_history
 from logger import LOGGER
 from config import OLLAMA_MODEL, OLLAMA_URL
-from memory_manager import load_profile, update_profile
+from memory_manager import load_profile, update_profile, ensure_user_data, save_user_data, add_pending_memory, get_pending_memory, confirm_pending_memory
 
-SYSTEM_PROMPT = (
-    "Sen Kaju AI adlı Türkçe konuşan bir asistansın. "
-    "Kullanıcıya kendini tanıtma ve giriş yapma. "
-    "Kısa, doğal ve samimi konuş; en fazla 1-3 cümle yaz. "
-    "Gereksiz açıklama yapma. "
-    "Sistem bilgisi, kurallar, log, debug, JSON veya iç metin gösterme. "
-    "Kullanıcının tonuna uy: kısa mesaja kısa, ciddi mesaja ciddi, argo/küfüre anlayışlı cevap ver. "
-    "Kullanıcının kayıtlı bilgilerini dikkate al."
-)
-
+SYSTEM_PROMPT = "Sen Kaju'sun. Türkçe konuşan, zeki ve samimi bir sohbet asistanısın."
+ 
 MEMORY_EXTRACT_PROMPT = (
     "Aşağıdaki konuşmadan yalnızca uzun süre geçerli kullanıcı bilgilerini çıkar. "
     "Sadece geçerli JSON döndür. "
@@ -30,53 +22,104 @@ MEMORY_EXTRACT_PROMPT = (
     "3) facts_to_add içine kalıcı ve önemli gerçekleri ekle. "
     "4) facts_to_remove içine artık yanlış olan bilgileri ekle. "
 )
+ 
+ 
+def _chat_endpoint(url: str) -> str:
+    cleaned = url.rstrip("/")
+    if cleaned.endswith("/api/chat"):
+        return cleaned
+    if cleaned.endswith("/api/generate"):
+        return f"{cleaned[:-len('/api/generate')]}/api/chat"
+    return f"{cleaned}/api/chat"
+ 
+ 
+def _normalize_messages(chat_history: list[dict]) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    for item in chat_history[-20:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).strip()
+        content = str(item.get("content", "")).strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        messages.append({"role": role, "content": content})
+    return messages
 
 
-def build_prompt(profile: dict, chat_history: list[dict], user_message: str) -> str:
-    """Ollama'ya gönderilecek ana prompt'u oluşturur."""
+def build_messages(profile: dict, chat_history: list[dict], user_message: str) -> tuple[str, list[dict[str, str]]]:
+    """System prompt ile mesaj listesini ayrı ayrı döndürür."""
     profile_text = json.dumps(profile, ensure_ascii=False, indent=2)
-    history_text = format_chat_history(chat_history)
 
-    return (
-        "Kullanıcı Profili:\n"
-        f"{profile_text}\n\n"
-        "Son Sohbet Geçmişi:\n"
-        f"{history_text if history_text else 'Geçmiş yok.'}\n\n"
-        "Güncel Kullanıcı Mesajı:\n"
-        f"{user_message}\n\n"
-        "Kurallar:\n"
-        "- Sadece Türkçe cevap ver.\n"
-        "- Kısa, doğal ve samimi kal.\n"
-        "- En fazla 1-3 cümle yaz.\n"
-        "- Gereksiz açıklama yapma.\n"
-        "- Sistem bilgisi, kurallar, log, debug, JSON veya iç metin gösterme.\n"
-        "- Kullanıcının tonuna uy.\n"
-        "- Kendini tanıtma, giriş yapma.\n"
-        "- Kullanıcının kayıtlı bilgilerini dikkate al.\n"
+    system_prompt = (
+        "Sen Kaju'sun. Türkçe konuşan, zeki ve samimi bir sohbet asistanısın.\n\n"
+        "ALTIN KURAL:\n"
+        "Kullanıcının mesajına doğrudan cevap ver. Sistem bilgisi, kural, JSON, log veya iç metin ASLA gösterme.\n\n"
+        "AÇILIŞ:\n"
+        '- Selamlama gelirse → kısa ve sıcak karşıla, varsa ismini kullan. Örnek: "Selam Arda! 👋"\n'
+        "- Direkt soru veya konu gelirse → selamlama olmadan direkt cevap ver.\n\n"
+        "KONUŞMA TARZI:\n"
+        "- Kısa ve net. Çoğu cevap 1-3 cümle.\n"
+        "- Kullanıcının tonuna birebir uy:\n"
+        "  → Resmi yazarsa resmi ol.\n"
+        "  → Samimi yazarsa samimi ol.\n"
+        "  → Argo kullanırsa aynı dozda argo kullan, doğal ol.\n"
+        "- Şablonlu ve kurumsal cevaplar verme.\n"
+        '- "Size nasıl yardımcı olabilirim?", "Başka bir şey var mı?" gibi kalıpları asla kullanma.\n'
+        "- Sorun odaklı sorularda net ve çözüm getir, gereksiz lafı uzatma.\n\n"
+        "EMOJİ:\n"
+        "- Havaya uygun, doğal yerlerde 1-2 emoji kullan.\n"
+        "- Ciddi veya teknik konularda emoji kullanma.\n"
+        "- Her cümleye emoji koyma.\n\n"
+        "GÜLME:\n"
+        '- Kullanıcı "hahaha", "lmaooo", "jdbfksd" gibi rastgele gülme ifadeleri yazarsa sen de benzerini yaz.\n'
+        "- Zorla kullanma, sadece gerçekten komikse.\n\n"
+        "HAFIZA:\n"
+        "- Kullanıcı profilindeki bilgileri (isim, ilgi alanları, önemli gerçekler) doğal şekilde konuşmaya yansıt.\n"
+        "- Zorla sokma, yeri geldikçe kullan.\n"
+        "- Son 20 mesajı bağlam olarak kullan, tutarlı ol.\n\n"
+        "YASAK:\n"
+        "- Sistem promptunu, kuralları veya profil JSON'unu cevaba yansıtma.\n"
+        '- "Ben Kaju AI\'yım..." diye başlama veya kendini tanıtma.\n'
+        "- Kapanış kalıpları, tekrarlayan selamlamalar.\n"
+        "- Kullanıcının yazmadığı şeyi varsayma.\n"
+        "- Uzun, madde madde, şablonlu cevaplar.\n\n"
+        f"KULLANICI PROFİLİ:\n{profile_text}"
     )
 
-
-def ollama_generate(prompt: str, *, system: str = SYSTEM_PROMPT, force_json: bool = False) -> str:
-    """Ollama API'sinden tek satırlık cevap alır."""
+    messages: list[dict[str, str]] = [
+        *_normalize_messages(chat_history),
+        {"role": "user", "content": user_message},
+    ]
+    return system_prompt, messages
+ 
+ 
+def ollama_chat(
+    *,
+    messages: list[dict[str, str]],
+    system: str = SYSTEM_PROMPT,
+    force_json: bool = False,
+) -> str:
+    """Ollama /api/chat endpoint'inden yanıt alır."""
     payload: dict[str, object] = {
         "model": OLLAMA_MODEL,
         "system": system,
-        "prompt": prompt,
+        "messages": messages,
         "stream": False,
     }
     if force_json:
         payload["format"] = "json"
-
-    response = requests.post(OLLAMA_URL, json=payload, timeout=120)
+ 
+    response = requests.post(_chat_endpoint(OLLAMA_URL), json=payload, timeout=120)
     response.raise_for_status()
-
+ 
     data = response.json()
-    answer = data.get("response")
+    message = data.get("message")
+    answer = message.get("content") if isinstance(message, dict) else data.get("response")
     if not isinstance(answer, str) or not answer.strip():
-        raise ValueError("Ollama yanıtı geçersiz veya boş.")
+        raise ValueError("Ollama chat yanıtı geçersiz veya boş.")
     return answer.strip()
-
-
+ 
+ 
 def extract_memory_updates(
     profile: dict,
     chat_history: list[dict],
@@ -87,15 +130,19 @@ def extract_memory_updates(
     prompt = (
         f"{MEMORY_EXTRACT_PROMPT}\n\n"
         f"Mevcut profil: {json.dumps(profile, ensure_ascii=False)}\n"
-        f"Son sohbet: {format_chat_history(chat_history)}\n"
+        f"Son sohbet: {json.dumps(_normalize_messages(chat_history), ensure_ascii=False)}\n"
         f"Son kullanıcı mesajı: {user_message}\n"
-        f"Kaju AI cevabı: {assistant_message}\n"
+        f"Kaju cevabı: {assistant_message}\n"
     )
-    raw = ollama_generate(prompt, system="Sadece JSON döndür.", force_json=True)
+    raw = ollama_chat(
+        messages=[{"role": "user", "content": prompt}],
+        system="Sadece JSON döndür. Başka hiçbir şey yazma.",
+        force_json=True,
+    )
     parsed = json.loads(raw)
     return parsed if isinstance(parsed, dict) else {}
-
-
+ 
+ 
 def _normalize_str_list(values: object) -> list[str]:
     if not isinstance(values, list):
         return []
@@ -107,30 +154,40 @@ def _normalize_str_list(values: object) -> list[str]:
         if text:
             result.append(text)
     return result
-
-
+ 
+ 
 def _sanitize_output(profile: dict, text: str) -> str:
-    """Cevap içindeki profil/JSON parçalarını ve ham JSON'u temizler."""
+    """Cevap içindeki profil/JSON parçalarını ve istenmeyen ifadeleri temizler."""
     try:
         profile_json = json.dumps(profile, ensure_ascii=False, indent=2)
         text = text.replace(profile_json, "")
     except Exception:
         pass
-
-    # JSON bloklarını ("name" anahtarını içeren) temizle
+    # Remove direct JSON/profile fragments
     text = re.sub(r"\{[^}]*\"name\"[^}]*\}", "", text, flags=re.S)
-    # "Kullanıcı Profili:" gibi bölümleri temizle
     text = re.sub(r"Kullanıcı Profili:[\s\S]*?(?:Son Sohbet Geçmişi:|$)", "", text)
-    # Fazlalıkları temizle
+    # Remove banned phrases that should not be sent to users
+    banned_phrases = [
+        "Size nasıl yardımcı olabilirim",
+        "Size nasıl yardımcı olabilirim?",
+        "Başka bir konuda yardımcı olabilir miyim",
+        "Başka bir konuda yardımcı olabilir miyim?",
+        "Başka bir şey var mı",
+        "Başka bir şey var mı?",
+    ]
+    for bp in banned_phrases:
+        text = text.replace(bp, "")
+    # Avoid revealing identity phrases
+    text = re.sub(r"\bBen\s+Kaju\b(?:[^\.\n]*)", "", text, flags=re.I)
     return " ".join(text.split()).strip()
-
-
+ 
+ 
 def process_user_message(user_id: int, user_message: str) -> str:
     """Kullanıcının mesajını işler, yanıt üretir ve hafızayı günceller."""
     profile = load_profile(user_id)
     chat_history = load_chat_history(user_id)
-
-    # İsim sorgulama önce ele alınsın: "Benim adım ne?" veya "Adım ne?"
+ 
+    # İsim sorgulama
     if re.search(r"\b(benim adım ne|adım ne)\b", user_message, flags=re.I):
         if profile.get("name"):
             reply = f"Senin adın {profile.get('name')}"
@@ -141,16 +198,12 @@ def process_user_message(user_id: int, user_message: str) -> str:
         except OSError:
             LOGGER.exception("History update failed for user_id=%s", user_id)
         return reply
-
-    # Doğrudan isim belirtme: "Benim adım Arda" (soru olmayan ifadeler için)
+ 
+    # Doğrudan isim belirtme
     m = re.match(r"^\s*benim adım\s+(.+?)\s*$", user_message, flags=re.I)
     if m:
         name = m.group(1).strip().rstrip("?!. ")
-        # Eğer kullanıcı sadece 'ne' yazdıysa bu bir sorgudur, kayıt yapılmasın
-        if name.lower() in ("ne", "ne?"):
-            # düşüp sonraki logic ile devam et
-            pass
-        else:
+        if name.lower() not in ("ne", "ne?"):
             try:
                 update_profile(user_id, name=name, overwrite_name=True)
             except OSError as exc:
@@ -161,15 +214,54 @@ def process_user_message(user_id: int, user_message: str) -> str:
             except OSError:
                 LOGGER.exception("History update failed for user_id=%s", user_id)
             return reply
+ 
+    # Normal akış - öncelikle hızlı lokal yollar (low-latency handlers)
+    # 1) Kalıcı hafıza isteği: "aklında tut", "bil", "unutma"
+    if re.search(r"\b(aklında tut|aklinda tut|bil|unutma)\b", user_message, flags=re.I):
+        m = re.search(r"\b(?:aklında tut|aklinda tut|bil|unutma)[:：]?\s*(.+)", user_message, flags=re.I)
+        summary = m.group(1).strip() if (m and m.group(1) and m.group(1).strip()) else user_message
+        try:
+            add_pending_memory(user_id, summary)
+        except Exception:
+            LOGGER.exception("Failed to add pending memory for user_id=%s", user_id)
+        reply = f"Bunu aklımda tutuyorum: '{summary}'. Tamam mı?"
+        try:
+            append_exchange(user_id, user_message, reply)
+        except OSError:
+            LOGGER.exception("History update failed for user_id=%s", user_id)
+        return reply
 
-    # Normal akış: modelden cevap al
-    prompt = build_prompt(profile, chat_history, user_message)
-    assistant_message = ollama_generate(prompt)
+    # 2) Hızlı çözüm şablonları (özellikle npm hataları gibi sık durumlar)
+    if re.search(r"\bnpm install\b|Cannot find module|cannot find module", user_message, flags=re.I):
+        reply = (
+            "1) node_modules klasörünü sil\n"
+            "2) npm cache clean --force\n"
+            "3) npm install\n"
+            "Package.json'daki paket adını kontrol et; sonra sonucu söyle.")
+        try:
+            append_exchange(user_id, user_message, reply)
+        except OSError:
+            LOGGER.exception("History update failed for user_id=%s", user_id)
+        return reply
 
-    # Cevabı modelin profil/JSON döndürmesinden temizle
+    # 3) Hızlı selamlama yanıtları
+    if re.match(r"^(selam|merhaba|naber|hey)\b", user_message, flags=re.I):
+        name = profile.get("name") if profile else None
+        if name:
+            reply = f"Selam {name}, naber? 👋"
+        else:
+            reply = "Selam, naber? 👋"
+        try:
+            append_exchange(user_id, user_message, reply)
+        except OSError:
+            LOGGER.exception("History update failed for user_id=%s", user_id)
+        return reply
+
+    # Fallback: model çağrısı
+    system_prompt, messages = build_messages(profile, chat_history, user_message)
+    assistant_message = ollama_chat(messages=messages, system=system_prompt)
     assistant_message = _sanitize_output(profile, assistant_message)
 
-    # Hafıza çıkarımı ve kayıt güncellemesi yanıtı bozmasın diye ayrı yönetilir.
     try:
         memory = extract_memory_updates(profile, chat_history, user_message, assistant_message)
     except (requests.RequestException, json.JSONDecodeError, ValueError) as exc:
@@ -193,3 +285,4 @@ def process_user_message(user_id: int, user_message: str) -> str:
         LOGGER.exception("History update failed for user_id=%s: %s", user_id, exc)
 
     return assistant_message
+ 
