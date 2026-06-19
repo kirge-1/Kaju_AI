@@ -44,3 +44,8 @@ Thumbs.db
 *.crt
 *.sqlite3
 *.db
+
+# test klasörleri
+5aşamalıplan/
+test_dosyaları/
+test_dosyalarına/

@@ -1,7 +1,7 @@
 import logging
 from pathlib import Path
 
-from config import LOGS_DIR
+from config import LOG_LEVEL, LOGS_DIR
 
 LOGGER_NAME = "kaju_bot"
 LOG_FILE = LOGS_DIR / "bot.log"
@@ -18,7 +18,7 @@ def get_logger() -> logging.Logger:
     if logger.handlers:
         return logger
 
-    logger.setLevel(logging.INFO)
+    logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
     logger.propagate = False
 
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")

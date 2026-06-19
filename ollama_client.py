@@ -7,7 +7,7 @@ import requests
  
 from history_manager import append_exchange, load_chat_history
 from logger import LOGGER
-from config import OLLAMA_MODEL, OLLAMA_URL
+from config import OLLAMA_MODEL, OLLAMA_URL, FAST_MODEL, ENABLE_STREAMING, CACHE_TTL_SECONDS
 from memory_manager import (
     load_profile,
     update_profile,
@@ -20,10 +20,12 @@ from memory_manager import (
     get_pending_followups,
     pop_pending_followups,
 )
+import time
 from cache import LRUCache
+from metrics import record_latency
 
-# Lightweight local cache for repeated queries
-CACHE = LRUCache(capacity=1024)
+# Lightweight local cache for repeated queries; TTL from config
+CACHE = LRUCache(capacity=1024, ttl_seconds=CACHE_TTL_SECONDS)
 
 # Quick-response templates (short, safe, tested)
 TEMPLATES = [
@@ -31,7 +33,7 @@ TEMPLATES = [
      "1) node_modules klasörünü sil\n2) npm cache clean --force\n3) npm install\nPackage.json'daki paket adını kontrol et; sonra sonucu söyle."),
     (re.compile(r"^(selam|merhaba|naber|hey)\b", flags=re.I),
      "Selam {name}, naber? 👋"),
-], ensure_user_data, save_user_data, add_pending_memory, get_pending_memory, confirm_pending_memory
+]
 SYSTEM_PROMPT = "Sen Kaju'sun. Türkçe konuşan, zeki ve samimi bir sohbet asistanısın."
  
 MEMORY_EXTRACT_PROMPT = (
@@ -122,20 +124,26 @@ def ollama_chat(
     messages: list[dict[str, str]],
     system: str = SYSTEM_PROMPT,
     force_json: bool = False,
+    model: str | None = None,
+    timeout: int = 10,
 ) -> str:
-    """Ollama /api/chat endpoint'inden yanıt alır."""
+    """Ollama /api/chat endpoint'inden yanıt alır. model belirtilirse onu kullanır; timeout saniye cinsindendir."""
+    chosen_model = model if model else OLLAMA_MODEL
     payload: dict[str, object] = {
-        "model": OLLAMA_MODEL,
+        "model": chosen_model,
         "system": system,
         "messages": messages,
         "stream": False,
     }
     if force_json:
         payload["format"] = "json"
- 
-    response = requests.post(_chat_endpoint(OLLAMA_URL), json=payload, timeout=120)
+
+    start = time.time()
+    response = requests.post(_chat_endpoint(OLLAMA_URL), json=payload, timeout=timeout)
+    elapsed_ms = (time.time() - start) * 1000.0
+    record_latency(chosen_model or 'default', elapsed_ms)
     response.raise_for_status()
- 
+
     data = response.json()
     message = data.get("message")
     answer = message.get("content") if isinstance(message, dict) else data.get("response")
@@ -314,7 +322,16 @@ def process_user_message(user_id: int, user_message: str) -> str:
 
     # Fallback: model çağrısı (yavaş ama tam)
     system_prompt, messages = build_messages(profile, chat_history, user_message)
-    assistant_message = ollama_chat(messages=messages, system=system_prompt)
+    # Try FAST_MODEL first if configured, with short timeout
+    assistant_message = None
+    if FAST_MODEL:
+        try:
+            assistant_message = ollama_chat(messages=messages, system=system_prompt, model=FAST_MODEL, timeout=5)
+        except Exception:
+            LOGGER.exception("Fast model failed or timed out for user_id=%s, falling back", user_id)
+            assistant_message = None
+    if not assistant_message:
+        assistant_message = ollama_chat(messages=messages, system=system_prompt, timeout=30)
     assistant_message = _sanitize_output(profile, assistant_message)
 
     try:
